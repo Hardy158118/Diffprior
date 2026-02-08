@@ -1,0 +1,980 @@
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import time
+import argparse
+import pickle
+import os
+import datetime
+from pprint import pprint
+
+import torch
+import torch.nn.functional as F
+from torch.autograd import Variable
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from sklearn.metrics import roc_auc_score
+
+from utils import *
+from modules import *
+from diffusion_prior2 import DiffusionPrior
+
+t_begin = time.time()
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--no-cuda', action='store_true', default=False,
+                    help='Disables CUDA training.')
+parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--epochs', type=int, default=500,
+                    help='Number of epochs to train.')
+parser.add_argument('--batch-size', type=int, default=128,
+                    help='Number of samples per batch.')
+parser.add_argument('--lr', type=float, default=0.0005,
+                    help='Initial learning rate.')
+parser.add_argument('--encoder-hidden', type=int, default=256,
+                    help='Number of hidden units.')
+parser.add_argument('--decoder-hidden', type=int, default=256,
+                    help='Number of hidden units.')
+parser.add_argument('--temp', type=float, default=0.5,
+                    help='Temperature for Gumbel softmax.')
+parser.add_argument('--num-atoms', type=int, default=5,
+                    help='Number of atoms in simulation.')
+parser.add_argument('--encoder', type=str, default='mlp',
+                    help='Type of path encoder model (mlp, cnn, or gin).')
+parser.add_argument('--decoder', type=str, default='mlp',
+                    help='Type of decoder model (mlp, rnn, or sim).')
+parser.add_argument('--no-factor', action='store_true', default=False,
+                    help='Disables factor graph model.')
+parser.add_argument('--suffix', type=str, default='',
+                    help='Suffix for training data (e.g. "_charged".')
+parser.add_argument('--encoder-dropout', type=float, default=0.0,
+                    help='Dropout rate (1 - keep probability).')
+parser.add_argument('--decoder-dropout', type=float, default=0.0,
+                    help='Dropout rate (1 - keep probability).')
+parser.add_argument('--save-folder', type=str, default='logs',
+                    help='Where to save the trained model, leave empty to not save anything.')
+parser.add_argument('--load-folder', type=str, default='',
+                    help='Where to load the trained model if finetunning. ' +
+                         'Leave empty to train from scratch')
+parser.add_argument('--edge-types', type=int, default=2,
+                    help='The number of edge types to infer.')
+parser.add_argument('--dims', type=int, default=4,
+                    help='The number of input dimensions (position + velocity).')
+parser.add_argument('--timesteps', type=int, default=49,
+                    help='The number of time steps per sample.')
+parser.add_argument('--prediction-steps', type=int, default=10, metavar='N',
+                    help='Num steps to predict before re-using teacher forcing.')
+parser.add_argument('--lr-decay', type=int, default=200,
+                    help='After how epochs to decay LR by a factor of gamma.')
+parser.add_argument('--gamma', type=float, default=0.5,
+                    help='LR decay factor.')
+parser.add_argument('--skip-first', action='store_true', default=True,
+                    help='Skip first edge type in decoder, i.e. it represents no-edge.')
+parser.add_argument('--var', type=float, default=5e-5,
+                    help='Output variance.')
+parser.add_argument('--hard', action='store_true', default=False,
+                    help='Uses discrete samples in training forward pass.')
+parser.add_argument('--prior', action='store_true', default=False,
+                    help='Whether to use sparsity prior.')
+parser.add_argument('--dynamic-graph', action='store_true', default=False,
+                    help='Whether test with dynamically re-computed graph.')
+# Diffusion prior (edge-wise DDPM on encoder logits)
+parser.add_argument('--use-diff-prior', action='store_true', default=False,
+                    help='Use diffusion prior on encoder logits (replaces KL term).')
+
+parser.add_argument('--diff-schedule', type=str, default='linear',
+                    help='Beta schedule: "cosine" or "linear".')
+parser.add_argument('--diff-time-emb-dim', type=int, default=64,
+                    help='Time embedding dimension for diffusion model.')
+parser.add_argument('--diff-hidden', type=int, default=128,
+                    help='Hidden size for diffusion eps network.')
+parser.add_argument('--diff-dropout', type=float, default=0.3,
+                    help='Dropout for diffusion eps network.')
+parser.add_argument('--lambda-diff', type=float, default=1.0,
+                    help='Weight for diffusion loss term in total loss.')
+parser.add_argument('--lambda-ent', type=float, default=1.0,
+                    help='Weight for entropy surrogate inside diffusion loss (default 1).')
+parser.add_argument('--diff-scale-by-T', action='store_true', default=False,
+                    help='If set, multiply DDPM MSE by T (approximate sum over timesteps).')
+
+# for benchmark:
+parser.add_argument('--save-probs', action='store_true', default=False,
+                    help='Save the probs during test.')
+parser.add_argument('--b-portion', type=float, default=1.0,
+                    help='Portion of data to be used in benchmarking.')
+parser.add_argument('--b-time-steps', type=int, default=49,
+                    help='Portion of time series in data to be used in benchmarking.')
+parser.add_argument('--b-shuffle', action='store_true', default=False,
+                    help='Shuffle the data for benchmarking?.')
+parser.add_argument('--b-manual-nodes', type=int, default=15,
+                    help='The number of nodes if changed from the original dataset.')
+parser.add_argument('--data-path', type=str, default='',
+                    help='Where to load the data. May input the paths to edges_train of the data.')
+parser.add_argument('--b-network-type', type=str, default='',
+                    help='What is the network type of the graph.')
+parser.add_argument('--b-directed', action='store_true', default=False,
+                    help='Default choose trajectories from undirected graphs.')
+parser.add_argument('--b-simulation-type', type=str, default='',
+                    help='Either springs or netsims.')
+parser.add_argument('--b-suffix', type=str, default='',
+    help='The rest to locate the exact trajectories. E.g. "50r1_n1" for 50 nodes, rep 1 and noise level 1.'
+         ' Or "50r1" for 50 nodes, rep 1 and noise free.')
+# remember to disable this for submission
+parser.add_argument('--b-walltime', action='store_true', default=True,
+                    help='Set wll time for benchmark training and testing. (Max time = 2 days)')
+parser.add_argument('--diff-refine-t-start', type=int, default=None,
+                    help='Start timestep for refinement. If None, use diff_T. Smaller is faster/stabler.')
+
+parser.add_argument('--diff-refine-stochastic', action='store_true', default=False,
+                    help='If set, add noise in reverse steps; otherwise deterministic(mean-only).')
+parser.add_argument('--diff-refine-gamma', type=float, default=0.1,
+                    help='Residual scale gamma for one-step refinement: z_ref = z + gamma*(z0_hat - z).')
+parser.add_argument('--diff-T', type=int, default=100,
+                    help='Number of diffusion timesteps.')
+
+# one-step refinement (Scheme B)
+parser.add_argument('--diff-t-ref', type=int, default=30,
+                    help='Fixed timestep t_ref for one-step refinement (decoder input).')
+
+parser.add_argument('--diff-refine-noise', type=str, default='fixed', choices=['zero', 'fixed'],
+                    help='Noise mode used when forming z_t for refinement (Scheme B).')
+parser.add_argument('--diff-refine-noise-seed', type=int, default=0,
+                    help='Seed for fixed noise when diff-refine-noise=fixed.')
+parser.add_argument('--diff-refine-clip', type=float, default=None,
+                    help='Optional clip value for z0_hat during refinement (stability).')
+
+# (A)(B) diffusion loss sampling strategy
+parser.add_argument('--diff-train-t-max', type=int, default=60,
+                    help='Max timestep for diffusion loss sampling. Suggest ~2*t_ref.')
+parser.add_argument('--diff-train-k', type=int, default=2,
+                    help='Number of sampled timesteps per edge for diffusion loss (K).')
+parser.add_argument('--diff-variance-type', type=str, default='beta', choices=['beta', 'posterior'],
+                    help='Which sigma_t^2 to use in w_t.')
+
+# optional: whether diffusion loss backprops to encoder
+parser.add_argument('--diff-detach-encoder-in-diff', action='store_true', default=False,
+                    help='If set, diffusion loss will not backprop to encoder (only denoiser).')
+parser.add_argument('--save-diag', action='store_true', default=False,
+                    help='Save posterior+labels for entropy/ECE diagnostics (Table2/Fig2).')
+parser.add_argument('--save-logits', action='store_true', default=False,
+                    help='Also save refined logits (lij). Can be large for big graphs.')
+# Stress tests
+
+# Stress tests (Table 3)
+parser.add_argument('--stress-short-T', action='store_true', default=False,
+                    help='Short-T: use T <- floor(T/2) for train/valid and test slicing.')
+parser.add_argument('--stress-missing-rate', type=float, default=0.0,
+                    help='Missing rate r in [0,1]. 0 disables. Suggested 0.3.')
+parser.add_argument('--stress-noise-std', type=float, default=0.0,
+                    help='Gaussian noise std added AFTER normalization to [-1,1]. 0 disables.')
+parser.add_argument('--stress-data-seed', type=int, default=None,
+                    help='Seed for missing/noise generation. If None, uses --seed.')
+
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+args.factor = not args.no_factor
+print(args)
+# ----------------------------
+# Stress config (must be BEFORE prediction_steps clamp and BEFORE loading data)
+# ----------------------------
+if args.stress_data_seed is None:
+    args.stress_data_seed = args.seed
+
+# Short-T: change timesteps globally (avoid hardcoding 25)
+if args.stress_short_T:
+    new_T = max(2, args.timesteps // 2)
+    args.timesteps = new_T
+    args.b_time_steps = new_T  # for portion_data(train/valid)
+
+if args.suffix == "":
+    args.suffix = args.b_simulation_type
+    args.timesteps = args.b_time_steps
+
+if args.b_simulation_type == 'springs':
+    args.dims = 4
+elif args.b_simulation_type == 'netsims':
+    args.dims = 1
+
+if args.data_path == "" and args.b_network_type != "":
+    if args.b_directed:
+        dir_str = 'directed'
+    else:
+        dir_str = 'undirected'
+    args.data_path = os.path.dirname(os.path.dirname(os.getcwd())) + '/simulations/' + args.b_network_type + '/' + \
+                     dir_str +\
+                     '/' + args.b_simulation_type + '/edges_train_' + args.b_simulation_type + args.b_suffix + '.npy'
+    args.b_manual_nodes = int(args.b_suffix.split('r')[0])
+if args.data_path != '':
+    args.num_atoms = args.b_manual_nodes
+# if args.data_path != '':
+#     args.suffix = args.data_path.split('/')[-1].split('_', 2)[-1]
+
+print("suffix: ", args.suffix)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if args.cuda:
+    torch.cuda.manual_seed(args.seed)
+
+if args.dynamic_graph:
+    print("Testing with dynamically re-computed graph.")
+
+# Save model and meta-data. Always saves in a new sub-folder.
+# if args.save_folder:
+#     exp_counter = 0
+#     now = datetime.datetime.now()
+#     timestamp = now.isoformat()
+#     if not os.path.exists(args.save_folder):
+#         os.mkdir(args.save_folder)
+#     name_str = args.data_path.split('/')[-4] + '_' + args.data_path.split('/')[-3] + '_' + \
+#                args.data_path.split('/')[-1].split('_', 2)[-1].split('.')[0]
+#     # save_folder = '{}/exp{}/'.format(args.save_folder, timestamp)
+#     save_folder = './{}/NRI-{}-E{}-D{}-exp{}/'.format(args.save_folder, name_str, args.encoder,
+#                                                       args.decoder, timestamp)
+#     os.mkdir(save_folder)
+#     meta_file = os.path.join(save_folder, 'metadata.pkl')
+#     encoder_file = os.path.join(save_folder, 'encoder.pt')
+#     decoder_file = os.path.join(save_folder, 'decoder.pt')
+#     res_folder = save_folder + 'results/'
+#     os.mkdir(res_folder)
+#     log_file = os.path.join(save_folder, 'log.txt')
+#     log = open(log_file, 'w')
+
+#     pickle.dump({'args': args}, open(meta_file, "wb"))
+# else:
+#     print("WARNING: No save_folder provided!" +
+#           "Testing (within this script) will throw an error.")
+# Save model and meta-data. Use exactly --save-folder as the run directory.
+log = None
+log_all = None
+
+if args.save_folder:
+    save_folder = os.path.abspath(os.path.expanduser(args.save_folder))
+    os.makedirs(save_folder, exist_ok=True)
+
+    meta_file = os.path.join(save_folder, 'metadata.pkl')
+    encoder_file = os.path.join(save_folder, 'encoder.pt')
+    decoder_file = os.path.join(save_folder, 'decoder.pt')
+    prior_file = os.path.join(save_folder, 'diffusion_prior.pt')
+
+    res_folder = os.path.join(save_folder, 'results')
+    os.makedirs(res_folder, exist_ok=True)
+
+    # log: only write when validation improves (same behavior as before)
+    log_file = os.path.join(save_folder, 'log.txt')
+    log = open(log_file, 'w')
+
+    # log_all: write every epoch + header args
+    log_all_file = os.path.join(save_folder, 'log_all.txt')
+    log_all = open(log_all_file, 'w')
+
+    # 2) pprint args at the beginning of log_all
+    pprint(vars(args), stream=log_all)
+    print("\n", file=log_all)
+    log_all.flush()
+
+    pickle.dump({'args': args}, open(meta_file, "wb"))
+else:
+    print("WARNING: No save_folder provided! Testing (within this script) will throw an error.")
+
+if args.prediction_steps > args.timesteps:
+    args.prediction_steps = args.timesteps
+
+if args.suffix == "springs":
+    train_loader, valid_loader, test_loader, loc_max, loc_min, vel_max, vel_min = load_customized_springs_data(
+        args)
+else:
+    train_loader, valid_loader, test_loader, loc_max, loc_min, vel_max, vel_min = load_customized_netsims_data(
+        args)
+
+# original:
+# train_loader, valid_loader, test_loader, loc_max, loc_min, vel_max, vel_min = load_data(
+#     args.batch_size, args.suffix)
+
+# Generate off-diagonal interaction graph: discarded
+# off_diag = np.ones([args.num_atoms, args.num_atoms]) - np.eye(args.num_atoms)
+print("num_atoms: ", args.num_atoms)
+
+# Infer edge set (E) from dataset relations, then build rel_rec / rel_send accordingly.
+# Dataset may provide relations as [B, E] (flattened) or [B, N, N] (matrix).
+_sample = next(iter(train_loader))
+if isinstance(_sample, (list, tuple)) and len(_sample) >= 2:
+    _relations0 = _sample[1]
+else:
+    raise RuntimeError("train_loader should yield (data, relations).")
+
+RELATIONS_ARE_MATRIX = False
+if torch.is_tensor(_relations0):
+    _r0 = _relations0
+else:
+    _r0 = torch.tensor(_relations0)
+
+if _r0.dim() == 3 and _r0.size(1) == args.num_atoms and _r0.size(2) == args.num_atoms:
+    E_infer = args.num_atoms * args.num_atoms
+    RELATIONS_ARE_MATRIX = True
+elif _r0.dim() == 2:
+    E_infer = _r0.size(1)
+elif _r0.dim() == 1:
+    E_infer = _r0.numel()
+else:
+    raise ValueError(f"Unexpected relations shape from dataloader: {tuple(_r0.shape)}")
+
+N = args.num_atoms
+if E_infer == N * N:
+    off_diag = np.ones([N, N], dtype=np.float32)  # include self-loop
+elif E_infer == N * (N - 1):
+    off_diag = np.ones([N, N], dtype=np.float32) - np.eye(N, dtype=np.float32)  # exclude self-loop
+else:
+    raise ValueError(
+        f"Cannot infer edge set: relations provide E={E_infer}, but N={N} => N^2={N*N}, N(N-1)={N*(N-1)}. "
+        "Please verify dataset relations encoding."
+    )
+
+rel_rec = np.array(encode_onehot(np.where(off_diag)[0]), dtype=np.float32)
+rel_send = np.array(encode_onehot(np.where(off_diag)[1]), dtype=np.float32)
+
+rel_rec = torch.FloatTensor(rel_rec)
+rel_send = torch.FloatTensor(rel_send)
+
+if args.encoder == 'mlp':
+    encoder = MLPEncoder(args.timesteps * args.dims, args.encoder_hidden,
+                         args.edge_types,
+                         args.encoder_dropout, args.factor)
+elif args.encoder == 'cnn':
+    encoder = CNNEncoder(args.dims, args.encoder_hidden,
+                         args.edge_types,
+                         args.encoder_dropout, args.factor)
+elif args.encoder == 'gin':
+    encoder = GINEncoder(args.timesteps * args.dims, args.encoder_hidden,
+                         args.edge_types,
+                         args.encoder_dropout, args.factor)
+
+
+
+
+
+if args.decoder == 'mlp':
+    decoder = MLPDecoder(n_in_node=args.dims,
+                         edge_types=args.edge_types,
+                         msg_hid=args.decoder_hidden,
+                         msg_out=args.decoder_hidden,
+                         n_hid=args.decoder_hidden,
+                         do_prob=args.decoder_dropout,
+                         skip_first=args.skip_first)
+elif args.decoder == 'rnn':
+    decoder = RNNDecoder(n_in_node=args.dims,
+                         edge_types=args.edge_types,
+                         n_hid=args.decoder_hidden,
+                         do_prob=args.decoder_dropout,
+                         skip_first=args.skip_first)
+elif args.decoder == 'sim':
+    decoder = SimulationDecoder(loc_max, loc_min, vel_max, vel_min, args.suffix)
+diff_prior = None
+if args.use_diff_prior:
+    diff_prior = DiffusionPrior(
+        latent_dim=args.edge_types,
+        timesteps=args.diff_T,
+        schedule=args.diff_schedule,
+        time_emb_dim=args.diff_time_emb_dim,
+        hidden_dim=args.diff_hidden,
+        dropout=args.diff_dropout,
+        scale_by_timesteps=args.diff_scale_by_T,
+        variance_type=args.diff_variance_type,
+        train_t_max=args.diff_train_t_max,
+        train_num_t=args.diff_train_k,
+    )
+
+
+if args.load_folder:
+    encoder_file = os.path.join(args.load_folder, 'encoder.pt')
+    encoder.load_state_dict(torch.load(encoder_file))
+    decoder_file = os.path.join(args.load_folder, 'decoder.pt')
+    decoder.load_state_dict(torch.load(decoder_file))
+
+    if args.use_diff_prior and diff_prior is not None:
+        prior_file_load = os.path.join(args.load_folder, 'diffusion_prior.pt')
+        if os.path.exists(prior_file_load):
+            diff_prior.load_state_dict(torch.load(prior_file_load, map_location='cpu'))
+        else:
+            print("WARNING: diffusion_prior.pt not found in load_folder; diffusion prior will be randomly initialized.")
+
+
+   # args.save_folder = False
+
+params = list(encoder.parameters()) + list(decoder.parameters())
+if args.use_diff_prior and diff_prior is not None:
+    params += list(diff_prior.parameters())
+optimizer = optim.Adam(params, lr=args.lr)
+
+scheduler = lr_scheduler.StepLR(optimizer, step_size=args.lr_decay,
+                                gamma=args.gamma)
+
+# Linear indices of an upper triangular mx, used for acc calculation
+triu_indices = get_triu_offdiag_indices(args.num_atoms)
+tril_indices = get_tril_offdiag_indices(args.num_atoms)
+
+if args.prior:
+    prior = np.array([0.97,0.03])  # TODO: hard coded for now
+    print("Using prior")
+    print(prior)
+    log_prior = torch.FloatTensor(np.log(prior))
+    log_prior = torch.unsqueeze(log_prior, 0)
+    log_prior = torch.unsqueeze(log_prior, 0)
+    log_prior = Variable(log_prior)
+
+    if args.cuda:
+        log_prior = log_prior.cuda()
+
+
+
+# if args.prior:
+#     # p0: no-edge 的先验概率（你原来写死的 0.91）
+#     p0 = 0.91
+#     K = args.edge_types
+
+#     if K < 2:
+#         raise ValueError(f"edge_types must be >= 2 when using prior, got {K}")
+
+#     # 自适应构造 prior: [p0, (1-p0)/(K-1), ..., (1-p0)/(K-1)]
+#     prior = np.zeros(K, dtype=np.float32)
+#     prior[0] = p0
+#     prior[1:] = (1.0 - p0) / (K - 1)
+
+#     # 数值稳定（可选但建议）
+#     eps = 1e-16
+#     prior = np.clip(prior, eps, 1.0)
+#     prior = prior / prior.sum()
+
+#     print("Using prior (adaptive)")
+#     print("edge_types:", K)
+#     print("prior:", prior)
+
+#     # log_prior shape: [1, 1, K] 以便和 prob 的 [B, E, K] 广播
+#     log_prior = torch.log(torch.tensor(prior, dtype=torch.float32)).view(1, 1, K)
+#     log_prior = Variable(log_prior)
+
+#     if args.cuda:
+#         log_prior = log_prior.cuda()
+
+
+
+
+if args.cuda:
+    encoder.cuda()
+    decoder.cuda()
+    if args.use_diff_prior and diff_prior is not None:
+        diff_prior.cuda()
+    rel_rec = rel_rec.cuda()
+    rel_send = rel_send.cuda()
+    triu_indices = triu_indices.cuda()
+    tril_indices = tril_indices.cuda()
+
+rel_rec = Variable(rel_rec)
+rel_send = Variable(rel_send)
+
+
+def train(epoch, best_val_loss):
+    t = time.time()
+    nll_train = []
+    acc_train = []
+    kl_train = []
+    mse_train = []
+    diff_train = []
+    diff_ddpm_train = []
+  
+
+    encoder.train()
+    decoder.train()
+    if args.use_diff_prior and diff_prior is not None:
+        diff_prior.train()
+
+    scheduler.step()
+    for batch_idx, (data, relations) in enumerate(train_loader):
+
+        if args.cuda:
+            data, relations = data.cuda(), relations.cuda()
+        if RELATIONS_ARE_MATRIX and relations.dim() == 3:
+            relations = relations.view(relations.size(0), -1)
+        data, relations = Variable(data), Variable(relations)
+
+        optimizer.zero_grad()
+
+        logits = encoder(data, rel_rec, rel_send)
+
+        if args.use_diff_prior and diff_prior is not None:
+            logits_refined = diff_prior.refine_one_step(
+                logits,
+                t_ref=args.diff_t_ref,
+                gamma=args.diff_refine_gamma,
+                noise_mode=args.diff_refine_noise,
+                noise_seed=args.diff_refine_noise_seed,
+                clip_denoised=args.diff_refine_clip,
+                use_eval=True,   # 关键：训练时也禁用dropout，让decoder输入稳定
+            )
+        else:
+            logits_refined = logits
+
+        edges = gumbel_softmax(logits_refined, tau=args.temp, hard=args.hard)
+        prob = my_softmax(logits_refined, -1)
+
+
+
+        if args.decoder == 'rnn':
+            output = decoder(data, edges, rel_rec, rel_send, 100,
+                             burn_in=True,
+                             burn_in_steps=args.timesteps - args.prediction_steps)
+        else:
+            output = decoder(data, edges, rel_rec, rel_send,
+                             args.prediction_steps)
+
+        target = data[:, :, 1:, :]
+
+        loss_nll = nll_gaussian(output, target, args.var)
+
+        if args.use_diff_prior and diff_prior is not None:
+            logits_for_diff = logits.detach() if args.diff_detach_encoder_in_diff else logits
+
+            out = diff_prior.loss(
+                logits_for_diff,
+                t_max=args.diff_train_t_max,
+                num_t_samples=args.diff_train_k,
+            )
+            if isinstance(out, tuple):
+                loss_diff, stats = out
+            else:
+                loss_diff, stats = out, {}
+
+            loss_kl = args.lambda_diff * loss_diff
+
+
+            # --- 记录扩散项（用于print/log）---
+            diff_train.append(loss_diff.item())
+            if isinstance(stats, dict) and len(stats) > 0:
+                if "diff_ddpm_mse" in stats:
+                    diff_ddpm_train.append(stats["diff_ddpm_mse"].item())
+
+        else:
+            if args.prior:
+                loss_kl = kl_categorical(prob, log_prior, args.num_atoms)
+            else:
+                loss_kl = kl_categorical_uniform(prob, args.num_atoms, args.edge_types)
+
+
+        loss = loss_nll + loss_kl
+
+
+        acc = edge_accuracy(logits_refined, relations)
+
+        acc_train.append(acc)
+
+        loss.backward()
+        optimizer.step()
+
+        mse_train.append(F.mse_loss(output, target).item())
+        nll_train.append(loss_nll.item())
+        kl_train.append(loss_kl.item())
+
+    nll_val = []
+    acc_val = []
+    kl_val = []
+    mse_val = []
+    diff_val = []
+    diff_ddpm_val = []
+
+
+    encoder.eval()
+    decoder.eval()
+    if args.use_diff_prior and diff_prior is not None:
+        diff_prior.eval()
+    #加了一个禁止梯度
+    with torch.no_grad():
+        for batch_idx, (data, relations) in enumerate(valid_loader):
+            if args.cuda:
+                data, relations = data.cuda(), relations.cuda()
+            if RELATIONS_ARE_MATRIX and relations.dim() == 3:
+                relations = relations.view(relations.size(0), -1)
+            logits = encoder(data, rel_rec, rel_send)
+
+            if args.use_diff_prior and diff_prior is not None:
+                logits_refined = diff_prior.refine_one_step(
+                    logits,
+                    t_ref=args.diff_t_ref,
+                    gamma=args.diff_refine_gamma,
+                    noise_mode=args.diff_refine_noise,
+                    noise_seed=args.diff_refine_noise_seed,
+                    clip_denoised=args.diff_refine_clip,
+                    use_eval=True,   # 关键：训练时也禁用dropout，让decoder输入稳定
+                )
+            else:
+                logits_refined = logits
+
+            edges = gumbel_softmax(logits_refined, tau=args.temp, hard=args.hard)
+            prob = my_softmax(logits_refined, -1)
+
+
+
+            # validation output uses teacher forcing
+            output = decoder(data, edges, rel_rec, rel_send, 1)
+
+            target = data[:, :, 1:, :]
+            loss_nll = nll_gaussian(output, target, args.var)
+            if args.use_diff_prior and diff_prior is not None:
+                logits_for_diff = logits.detach() if args.diff_detach_encoder_in_diff else logits
+
+                out = diff_prior.loss(
+                    logits_for_diff,
+                    t_max=args.diff_train_t_max,
+                    num_t_samples=args.diff_train_k,
+                )
+                if isinstance(out, tuple):
+                    loss_diff, stats = out
+                else:
+                    loss_diff, stats = out, {}
+
+                loss_kl = args.lambda_diff * loss_diff
+
+
+                diff_val.append(loss_diff.item())
+                if isinstance(stats, dict) and len(stats) > 0:
+                    if "diff_ddpm_mse" in stats:
+                        diff_ddpm_val.append(stats["diff_ddpm_mse"].item())
+
+            else:
+                loss_kl = kl_categorical_uniform(prob, args.num_atoms, args.edge_types)
+
+            acc = edge_accuracy(logits_refined, relations)
+
+            acc_val.append(acc)
+
+            mse_val.append(F.mse_loss(output, target).item())
+            nll_val.append(loss_nll.item())
+            kl_val.append(loss_kl.item())
+
+    print('Epoch: {:04d}'.format(epoch),
+          'nll_train: {:.10f}'.format(np.mean(nll_train)),
+          'kl_train: {:.10f}'.format(np.mean(kl_train)),
+          'mse_train: {:.10f}'.format(np.mean(mse_train)),
+          'acc_train: {:.10f}'.format(np.mean(acc_train)),
+          'nll_val: {:.10f}'.format(np.mean(nll_val)),
+          'kl_val: {:.10f}'.format(np.mean(kl_val)),
+          'mse_val: {:.10f}'.format(np.mean(mse_val)),
+          'acc_val: {:.10f}'.format(np.mean(acc_val)),
+          'time: {:.4f}s'.format(time.time() - t))
+    if log_all is not None:
+        if args.use_diff_prior and diff_prior is not None:
+            print('Epoch: {:04d}'.format(epoch),
+                'nll_train: {:.10f}'.format(np.mean(nll_train)),
+                'diff_train: {:.10f}'.format(np.mean(diff_train) if len(diff_train) else float('nan')),
+                'diff_ddpm: {:.10f}'.format(np.mean(diff_ddpm_train) if len(diff_ddpm_train) else float('nan')),
+                'diff_w_train: {:.10f}'.format(np.mean(kl_train)),
+                'mse_train: {:.10f}'.format(np.mean(mse_train)),
+                'acc_train: {:.10f}'.format(np.mean(acc_train)),
+                'nll_val: {:.10f}'.format(np.mean(nll_val)),
+                'diff_val: {:.10f}'.format(np.mean(diff_val) if len(diff_val) else float('nan')),
+                'diff_ddpm_val: {:.10f}'.format(np.mean(diff_ddpm_val) if len(diff_ddpm_val) else float('nan')),
+
+                'diff_w_val: {:.10f}'.format(np.mean(kl_val)),
+                'mse_val: {:.10f}'.format(np.mean(mse_val)),
+                'acc_val: {:.10f}'.format(np.mean(acc_val)),
+                'time: {:.4f}s'.format(time.time() - t),
+                file=log_all)
+        else:
+            print('Epoch: {:04d}'.format(epoch),
+                'nll_train: {:.10f}'.format(np.mean(nll_train)),
+                'kl_train: {:.10f}'.format(np.mean(kl_train)),
+                'mse_train: {:.10f}'.format(np.mean(mse_train)),
+                'acc_train: {:.10f}'.format(np.mean(acc_train)),
+                'nll_val: {:.10f}'.format(np.mean(nll_val)),
+                'kl_val: {:.10f}'.format(np.mean(kl_val)),
+                'mse_val: {:.10f}'.format(np.mean(mse_val)),
+                'acc_val: {:.10f}'.format(np.mean(acc_val)),
+                'time: {:.4f}s'.format(time.time() - t),
+                file=log_all)
+        log_all.flush()
+
+
+    # if args.save_folder and np.mean(nll_val) < best_val_loss:
+    if args.save_folder and np.mean(nll_val) < best_val_loss:
+        torch.save(encoder.state_dict(), encoder_file)
+        torch.save(decoder.state_dict(), decoder_file)
+        if args.use_diff_prior and diff_prior is not None:
+            torch.save(diff_prior.state_dict(), prior_file)
+
+        print('Best model so far, saving...')
+        if args.use_diff_prior and diff_prior is not None:
+            print('Epoch: {:04d}'.format(epoch),
+                'nll_train: {:.10f}'.format(np.mean(nll_train)),
+                'diff_train: {:.10f}'.format(np.mean(diff_train) if len(diff_train) else float('nan')),
+                'diff_ddpm: {:.10f}'.format(np.mean(diff_ddpm_train) if len(diff_ddpm_train) else float('nan')),
+                'diff_w_train: {:.10f}'.format(np.mean(kl_train)),   # = lambda_diff * diff_loss 的均值（你复用了 kl_train）
+                'mse_train: {:.10f}'.format(np.mean(mse_train)),
+                'acc_train: {:.10f}'.format(np.mean(acc_train)),
+                'nll_val: {:.10f}'.format(np.mean(nll_val)),
+                'diff_val: {:.10f}'.format(np.mean(diff_val) if len(diff_val) else float('nan')),
+                'diff_ddpm_val: {:.10f}'.format(np.mean(diff_ddpm_val) if len(diff_ddpm_val) else float('nan')),
+                'diff_w_val: {:.10f}'.format(np.mean(kl_val)),
+                'mse_val: {:.10f}'.format(np.mean(mse_val)),
+                'acc_val: {:.10f}'.format(np.mean(acc_val)),
+                'time: {:.4f}s'.format(time.time() - t))
+        else:
+            print('Epoch: {:04d}'.format(epoch),
+                'nll_train: {:.10f}'.format(np.mean(nll_train)),
+                'kl_train: {:.10f}'.format(np.mean(kl_train)),
+                'mse_train: {:.10f}'.format(np.mean(mse_train)),
+                'acc_train: {:.10f}'.format(np.mean(acc_train)),
+                'nll_val: {:.10f}'.format(np.mean(nll_val)),
+                'kl_val: {:.10f}'.format(np.mean(kl_val)),
+                'mse_val: {:.10f}'.format(np.mean(mse_val)),
+                'acc_val: {:.10f}'.format(np.mean(acc_val)),
+                'time: {:.4f}s'.format(time.time() - t))
+
+        log.flush()
+    return np.mean(nll_val)
+
+
+def test():
+    acc_test = []
+    nll_test = []
+    kl_test = []
+    mse_test = []
+    prob_test = []
+    auroc_test = []
+    diff_test = []
+    diff_ddpm_test = []
+    rel_test = []
+    logits_test = []
+
+    tot_mse = 0
+    counter = 0
+
+    encoder.eval()
+    decoder.eval()
+    encoder.load_state_dict(torch.load(encoder_file))
+    decoder.load_state_dict(torch.load(decoder_file))
+    if args.use_diff_prior and diff_prior is not None and args.save_folder:
+        if os.path.exists(prior_file):
+            diff_prior.load_state_dict(torch.load(prior_file, map_location='cpu'))
+        diff_prior.eval()
+
+    with torch.no_grad():
+        for batch_idx, (data, relations) in enumerate(test_loader):
+            
+            if args.cuda:
+                data, relations = data.cuda(), relations.cuda()
+
+            if RELATIONS_ARE_MATRIX and relations.dim() == 3:
+                relations = relations.view(relations.size(0), -1)
+            relations_diag = relations
+            assert (data.size(2) - args.timesteps) >= args.timesteps
+
+            data_encoder = data[:, :, :args.timesteps, :].contiguous()
+            data_decoder = data[:, :, -args.timesteps:, :].contiguous()
+
+            logits = encoder(data_encoder, rel_rec, rel_send)
+
+            if args.use_diff_prior and diff_prior is not None:
+                logits_refined = diff_prior.refine_one_step(
+                    logits,
+                    t_ref=args.diff_t_ref,
+                    gamma=args.diff_refine_gamma,
+                    noise_mode=args.diff_refine_noise,
+                    noise_seed=args.diff_refine_noise_seed,
+                    clip_denoised=args.diff_refine_clip,
+                    use_eval=True,   # 关键：训练时也禁用dropout，让decoder输入稳定
+                )
+            else:
+                logits_refined = logits
+
+            edges = gumbel_softmax(logits_refined, tau=args.temp, hard=args.hard)
+            prob = my_softmax(logits_refined, -1)
+            K = logits_refined.size(-1)
+            E = logits_refined.size(1)
+            prob_np = logits_refined.detach().cpu().numpy()
+            relations_np = relations.detach().cpu().numpy()
+            if relations_diag.dim() == 3 and relations_diag.size(-1) == K:
+                rel_ids = relations_diag.argmax(dim=-1)          # [B, E]
+            elif relations_diag.dim() == 2 and relations_diag.size(1) == E * K:
+                rel_ids = relations_diag.view(-1, E, K).argmax(dim=-1)  # [B, E]
+            else:
+                rel_ids = relations_diag                          # [B, E] (assume already ids)
+
+            relations_np = rel_ids.detach().cpu().numpy().astype(np.int64)
+            
+            #新加
+            if args.save_probs or args.save_diag:
+                prob_test.append(prob_np.astype(np.float32))
+                rel_test.append(relations_np)
+
+            if args.save_logits:
+                logits_test.append(logits_refined.detach().cpu().numpy())
+
+            #prob_test.append(prob_np)
+            output = decoder(data_decoder, edges, rel_rec, rel_send, 1)
+
+            target = data_decoder[:, :, 1:, :]
+            loss_nll = nll_gaussian(output, target, args.var)
+            if args.use_diff_prior and diff_prior is not None:
+                logits_for_diff = logits.detach() if args.diff_detach_encoder_in_diff else logits
+
+                out = diff_prior.loss(
+                    logits_for_diff,
+                    t_max=args.diff_train_t_max,
+                    num_t_samples=args.diff_train_k,
+                )
+                if isinstance(out, tuple):
+                    loss_diff, stats = out
+                else:
+                    loss_diff, stats = out, {}
+
+                loss_kl = args.lambda_diff * loss_diff
+
+
+                diff_test.append(loss_diff.item())
+                if isinstance(stats, dict) and len(stats) > 0:
+                    if "diff_ddpm_mse" in stats:
+                        diff_ddpm_test.append(stats["diff_ddpm_mse"].item())
+            else:
+                loss_kl = kl_categorical_uniform(prob, args.num_atoms, args.edge_types)
+
+
+
+
+            acc = edge_accuracy(logits_refined, relations)
+            acc_test.append(acc)
+
+            preds_np = prob_np[:, :, 1]
+            for i in range(len(prob_np)):
+                # print("relation: ", relations_np[i])
+                # print("preds: ", preds_np[i])
+                auroc = roc_auc_score(relations_np[i], preds_np[i], average=None)
+                auroc_test.append(auroc)
+
+            mse_test.append(F.mse_loss(output, target).item())
+            nll_test.append(loss_nll.item())
+            kl_test.append(loss_kl.item())
+
+            # For plotting purposes
+            if args.decoder == 'rnn':
+                if args.dynamic_graph:
+                    output = decoder(data, edges, rel_rec, rel_send, 100,
+                                    burn_in=True, burn_in_steps=args.timesteps,
+                                    dynamic_graph=True, encoder=encoder,
+                                    temp=args.temp)
+                else:
+                    output = decoder(data, edges, rel_rec, rel_send, 100,
+                                    burn_in=True, burn_in_steps=args.timesteps)
+                output = output[:, :, args.timesteps:, :]
+                target = data[:, :, -args.timesteps:, :]
+            else:
+                data_plot = data[:, :, args.timesteps:args.timesteps + 21,
+                            :].contiguous()
+                output = decoder(data_plot, edges, rel_rec, rel_send, 20)
+                target = data_plot[:, :, 1:, :]
+
+            mse = ((target - output) ** 2).mean(dim=0).mean(dim=0).mean(dim=-1)
+            tot_mse += mse.data.cpu().numpy()
+            counter += 1
+    if args.save_probs or args.save_diag:
+        probs_all = np.concatenate(prob_test, axis=0)
+        rels_all  = np.concatenate(rel_test, axis=0)
+
+        np.save(os.path.join(res_folder, 'edges_test.npy'), probs_all)
+        np.save(os.path.join(res_folder, 'relations_test.npy'), rels_all)
+
+        np.savez(os.path.join(res_folder, 'posterior_test.npz'),
+                probs=probs_all, labels=rels_all)
+
+        print("Saved posterior_test.npz / edges_test.npy / relations_test.npy to:", res_folder)
+
+    if args.save_logits:
+        logits_all = np.concatenate(logits_test, axis=0)
+        np.save(os.path.join(res_folder, 'logits_refined_test.npy'), logits_all)
+
+    mean_mse = tot_mse / counter
+    mse_str = '['
+    for mse_step in mean_mse[:-1]:
+        mse_str += " {:.12f} ,".format(mse_step)
+    mse_str += " {:.12f} ".format(mean_mse[-1])
+    mse_str += ']'
+
+    print('--------------------------------')
+    print('--------Testing-----------------')
+    print('--------------------------------')
+    print('nll_test: {:.10f}'.format(np.mean(nll_test)),
+          'kl_test: {:.10f}'.format(np.mean(kl_test)),
+          'mse_test: {:.10f}'.format(np.mean(mse_test)),
+          'acc_test: {:.10f}'.format(np.mean(acc_test)),
+          'diff_test: {:.10f}'.format(np.mean(diff_test) if len(diff_test) else float('nan')),
+          'diff_ddpm: {:.10f}'.format(np.mean(diff_ddpm_test) if len(diff_ddpm_test) else float('nan')),
+          'diff_w_test: {:.10f}'.format(np.mean(kl_test)),  # = lambda_diff * diff_test(均值)
+          'auroc_test: {:.10f}'.format(np.mean(auroc_test)))
+    print('MSE: {}'.format(mse_str))
+    if log_all is not None:
+        print('--------------------------------', file=log_all)
+        print('--------Testing-----------------', file=log_all)
+        print('--------------------------------', file=log_all)
+        print('nll_test: {:.10f}'.format(np.mean(nll_test)),
+            'kl_test: {:.10f}'.format(np.mean(kl_test)),
+            'mse_test: {:.10f}'.format(np.mean(mse_test)),
+            'diff_test: {:.10f}'.format(np.mean(diff_test) if len(diff_test) else float('nan')),
+            'diff_ddpm: {:.10f}'.format(np.mean(diff_ddpm_test) if len(diff_ddpm_test) else float('nan')),
+            'diff_w_test: {:.10f}'.format(np.mean(kl_test)),  # = lambda_diff * diff_test(均值)
+            'acc_test: {:.10f}'.format(np.mean(acc_test)),
+            'auroc_test: {:.10f}'.format(np.mean(auroc_test)),
+            file=log_all)
+        print('MSE: {}'.format(mse_str), file=log_all)
+        log_all.flush()
+
+    if args.save_folder:
+        print('--------------------------------', file=log)
+        print('--------Testing-----------------', file=log)
+        print('--------------------------------', file=log)
+        print('nll_test: {:.10f}'.format(np.mean(nll_test)),
+              'kl_test: {:.10f}'.format(np.mean(kl_test)),
+              'mse_test: {:.10f}'.format(np.mean(mse_test)),
+              'acc_test: {:.10f}'.format(np.mean(acc_test)),
+              'diff_test: {:.10f}'.format(np.mean(diff_test) if len(diff_test) else float('nan')),
+              'diff_ddpm: {:.10f}'.format(np.mean(diff_ddpm_test) if len(diff_ddpm_test) else float('nan')),
+              'diff_w_test: {:.10f}'.format(np.mean(kl_test)),  # = lambda_diff * diff_test(均值)
+              'auroc_test: {:.10f}'.format(np.mean(auroc_test)),
+              file=log)
+        print('MSE: {}'.format(mse_str), file=log)
+        log.flush()
+
+    print("Finished.")
+    print("Dataset: ", args.suffix)
+    print("Ground truth graph locates at: ", args.data_path)
+    print("With portion: ", args.b_portion)
+    print("With ", args.b_time_steps, " time steps")
+
+# Train model
+t_total = time.time()
+best_val_loss = np.inf
+best_epoch = 0
+for epoch in range(args.epochs):
+    t_epoch_start = time.time()
+    val_loss = train(epoch, best_val_loss)
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_epoch = epoch
+    epoch_end_time = time.time()
+    epoch_time = epoch_end_time - t_epoch_start
+    if args.b_walltime:
+        if epoch_end_time - t_begin < 171900 - epoch_time:
+            continue
+        else:
+            break
+print("Optimization Finished!")
+print("Best Epoch: {:04d}".format(best_epoch))
+if args.save_folder:
+    print("Best Epoch: {:04d}".format(best_epoch), file=log)
+    log.flush()
+
+test()
+if log is not None:
+    print(save_folder)
+    log.close()
+if log_all is not None:
+    log_all.close()
