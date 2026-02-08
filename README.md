@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Diff-prior: Diffusion-based Graph Priors for Structure Discovery
 
 This repository provides **Diff-prior**, a **diffusion-parameterized** correlated structural prior that can be plugged into NRI-family backbones for binary structure recovery on the StructInfer benchmarks. We include three backbones:
@@ -138,3 +139,6 @@ python3 run.py \
   --diff-refine-clip 10 \
   --lambda-diff 100
 ```
+=======
+# Diffprior  
+>>>>>>> e6166bdcd9287df9afd41fb0e5b4ac61a10b5ede
