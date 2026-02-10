@@ -24,7 +24,6 @@ Benchmark trajectories are from **StructInfer**:
 - Benchmark page: https://structinfer.github.io/benchmark/
 
 You only need to set `--data-path` / `--data_path` to your local dataset directory.
-
 ## Running
 
 Key arguments shared by all backbones:
@@ -39,8 +38,19 @@ To run **Netsims**, change `--b-simulation-type netsims` (and `--dyn netsims` fo
 
 ---
 ## Run experiments
+In the experiment part, We conpare the following priors over edges:
 
-In general, following args are used to select the trajectories to be used for evaluation:
+(1) Uniform prior
+The edge and non-edge probabilities are uniformly distributed
+
+(2) Fixed sparse prior
+The edge-existence probability is set to 0.03,and 0.97 for non-edges. This value setting comes from classic NRI (ICML 2018).
+
+
+(3) Diff-prior 
+The diff-prior is learnable and correlated structural prior,which is proposed in our paper.
+
+For the experimental settings, some common args is listed in the following:
 
 ```python
 parser.add_argument('--b-time-steps', type=int, default=49,
@@ -65,16 +75,16 @@ parser.add_argument('--dyn', type=str, default='',
 ### (1) NRI + Diff-prior
 
 ```bash
-python3 train.py \
+python3 train_diff2.py \
   --save-probs \
   --b-simulation-type springs \
   --b-network-type brain_networks \
   --b-directed \
   --b-suffix 15r1 \
-  --epochs 600 \
+  --epochs 800 \
   --b-shuffle \
-  --save-folder ( the path where you want to save) \
-  --data-path ( the path to the dataset) \
+  --save-folder \
+  --data-path  \
   --num-atoms 15 \
   --timesteps 49 \
   --batch-size 64 \
@@ -100,8 +110,8 @@ python3 train.py \
   --b-suffix 15r1 \
   --epochs 800 \
   --b-shuffle \
-  --save_folder ( the path where you want to save) \
-  --data-path ( the path to the dataset) \
+  --save_folder  \
+  --data-path  \
   --num_atoms 15 \
   --timesteps 49 \
   --batch_size 64 \
