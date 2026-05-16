@@ -118,32 +118,6 @@ parser.add_argument('--dyn', type=str, default='',
 
 ---
 
-## Example Commands
-
-The following examples run **noise-free Springs trajectories** on **Brain Networks** with **15 nodes**, **repetition 1**, and **directed graphs**.
-
-Before running an experiment, set the following paths:
-
-```bash
-export DATA_DIR=/path/to/structinfer/dataset
-export OUTPUT_DIR=/path/to/save/results
-```
-
-To run **Netsims**, change:
-
-```bash
---b-simulation-type netsims
-```
-
-For MPM, also change:
-
-```bash
---dyn netsims
-```
-
-Please also update `DATA_DIR` to the corresponding Netsims dataset directory.
-
----
 
 ### NRI + Diff-prior
 
@@ -154,7 +128,7 @@ python3 train_diff2.py \
   --b-network-type brain_networks \
   --b-directed \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --b-shuffle \
   --save-folder "$OUTPUT_DIR" \
   --data-path "$DATA_DIR" \
@@ -182,7 +156,7 @@ python3 train.py \
   --b-directed \
   --b-simulation-type springs \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --b-shuffle \
   --save_folder "$OUTPUT_DIR" \
   --data-path "$DATA_DIR" \
@@ -211,7 +185,7 @@ python3 run.py \
   --b-directed \
   --b-simulation-type springs \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --save_folder "$OUTPUT_DIR" \
   --data_path "$DATA_DIR" \
   --size 15 \
@@ -227,23 +201,6 @@ python3 run.py \
 
 ---
 
-## Running Baselines
-
-The commands above enable **Diff-prior**. To run the uniform-prior or fixed-sparse-prior baselines, use the same dataset and backbone settings, but disable the Diff-prior flag and use the corresponding baseline-prior option implemented in each backbone.
-
-Because the three codebases do not use fully identical argument names, please check the argument parser of each training script before running a baseline:
-
-- NRI: `train_diff2.py`
-- ACD: `train.py`
-- MPM: `run.py`
-
----
-
-## Outputs
-
-When `--save-probs` is enabled, the inferred edge probabilities are saved under the specified output directory. The exact output file names and directory structure may differ across NRI, ACD, and MPM because the three implementations are based on different original codebases.
-
----
 
 ## Acknowledgements
 
@@ -268,7 +225,6 @@ If you find this repository useful, please consider citing our paper.
   title        = {Diff-prior: Diffusion-based Graph Priors for Structure Discovery},
   author       = {Qi Shao, Hao Guo, Jiawen Chen, Duxin Chen, Wenwu Yu},
   year         = {2026},
-  note         = {Please replace this entry with the official citation.}
 }
 ```
 
