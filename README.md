@@ -266,7 +266,7 @@ If you find this repository useful, please consider citing our paper.
 ```bibtex
 @misc{diffprior2026,
   title        = {Diff-prior: Diffusion-based Graph Priors for Structure Discovery},
-  author       = {Author Names},
+  author       = {Qi Shao, Hao Guo, Jiawen Chen, Duxin Chen, Wenwu Yu},
   year         = {2026},
   note         = {Please replace this entry with the official citation.}
 }
