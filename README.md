@@ -205,7 +205,7 @@ This repository builds on NRI-family backbones and adapts or extends parts of th
 
 - NRI: <https://github.com/ethanfetaya/NRI>
 - ACD: <https://github.com/loeweX/AmortizedCausalDiscovery>
-- MPM / NRI-MPM: <https://github.com/hilbert9221/NRI-MPM>
+- MPM: <https://github.com/hilbert9221/NRI-MPM>
 
 We thank the original authors for releasing their code. If you use this repository, please also cite the corresponding backbone papers.
 
