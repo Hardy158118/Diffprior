@@ -41,10 +41,7 @@ Benchmark trajectories are from **StructInfer**:
 
 Please download the corresponding StructInfer trajectories and set the dataset path in the commands below.
 
-Depending on the backbone, the dataset path argument is either:
 
-- `--data-path` for NRI and ACD
-- `--data_path` for MPM
 
 ---
 
@@ -104,7 +101,7 @@ parser.add_argument('--dyn', type=str, default='',
 ---
 
 ## Important Argument Differences
-
+The argument names differ across NRI, ACD, and MPM to remain consistent with their original codebases.
 | Item | NRI | ACD | MPM |
 |---|---|---|---|
 | Training script | `train_diff2.py` | `train.py` | `run.py` |
