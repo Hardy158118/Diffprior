@@ -81,7 +81,7 @@ python3 train_diff2.py \
   --b-network-type brain_networks \
   --b-directed \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --b-shuffle \
   --save-folder \
   --data-path  \
@@ -108,7 +108,7 @@ python3 train.py \
   --b-directed \
   --b-simulation-type springs \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --b-shuffle \
   --save_folder  \
   --data-path  \
@@ -135,7 +135,7 @@ python3 run.py \
   --b-directed \
   --b-simulation-type springs \
   --b-suffix 15r1 \
-  --epochs 800 \
+  --epochs 400 \
   --save_folder ( the path where you want to save) \
   --data_path ( the path to the dataset) \
   --size 15 \
