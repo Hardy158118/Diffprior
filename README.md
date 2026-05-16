@@ -6,7 +6,7 @@ We provide implementations based on three representative backbones:
 
 - **NRI**: Neural Relational Inference for Interacting Systems, ICML 2018
 - **ACD**: Amortized Causal Discovery: Learning to Infer Causal Graphs from Time-Series Data, CLeaR 2022
-- **MPM / NRI-MPM**: Neural Relational Inference with Efficient Message Passing Mechanisms, AAAI 2021
+- **MPM**: Neural Relational Inference with Efficient Message Passing Mechanisms, AAAI 2021
 
 > **Important:** The diffusion-prior flags and several common argument names are not identical across the three codebases. Please follow the per-backbone commands below instead of directly reusing one backbone's command for another backbone.
 
